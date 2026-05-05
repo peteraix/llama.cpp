@@ -1,0 +1,328 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+
+#if USE_SUBGROUP_ADD || USE_SUBGROUP_ADD_NO_SHMEM
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
+
+#include "types.glsl"
+
+// Fused gate+up+swiglu matvec for MoE FFN, q3_K. One pass: gate and up scales/quants are interleaved
+// inside a single inner loop so we have ONE barrier per super-block, B is read once, and the
+// silu(gate_out) * up_out elementwise ops are absorbed at the reduce/store step (Phase 3 Stage B).
+// Binding 4 (D_UP) is reserved for ABI compat with the unfused path but is NOT written.
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+layout (constant_id = 1) const uint NUM_ROWS = 1;
+layout (constant_id = 2) const uint NUM_COLS = 1;
+
+layout (binding = 0) readonly buffer A_GATE   { block_q3_K          data_a_gate[];          };
+layout (binding = 0) readonly buffer A_GATE16 { block_q3_K_packed16 data_a_gate_packed16[]; };
+layout (binding = 1) readonly buffer B   { B_TYPE   data_b[];   };
+layout (binding = 1) readonly buffer BV2 { B_TYPEV2 data_b_v2[]; };
+layout (binding = 2) writeonly buffer D_GATE { D_TYPE data_d_gate[]; };
+layout (binding = 3) readonly buffer A_UP   { block_q3_K          data_a_up[];          };
+layout (binding = 3) readonly buffer A_UP16 { block_q3_K_packed16 data_a_up_packed16[]; };
+layout (binding = 4) writeonly buffer D_UP  { D_TYPE data_d_up[]; };
+layout (binding = 5) readonly buffer IDS    { int data_ids[]; };
+
+// NOTE: layout matches vk_mat_vec_id_push_constants for code re-use; fusion_flags unused here.
+layout (push_constant) uniform parameter
+{
+    uint ncols;
+    uint stride_a;
+    uint stride_b;
+    uint stride_d;
+
+    uint batch_stride_a;
+    uint batch_stride_b;
+    uint batch_stride_d;
+
+    uint fusion_flags;
+
+    uint nei0;
+    uint ne11;
+    uint expert_i1;
+    uint nbi1;
+} p;
+
+// Two scale caches, ping-ponged with csel (same trick as upstream q3_K).
+shared FLOAT_TYPE sccache_gate[2][BLOCK_SIZE/16][2][8];
+shared FLOAT_TYPE sccache_up  [2][BLOCK_SIZE/16][2][8];
+
+FLOAT_TYPE temp_gate[NUM_COLS][NUM_ROWS];
+FLOAT_TYPE temp_up  [NUM_COLS][NUM_ROWS];
+uint csel = 0;
+
+uint expert_id;
+
+void calc_superblock(const uint a_offset, const uint b_offset, const uint ix, const uint itid8,
+                     const uint v_im, const uint v_im4, const uint v_in, const uint32_t hm_m[4],
+                     const uint q_offset, const uint y_offset, const uint s_shift,
+                     const uint i, const uint num_blocks_per_row,
+                     const uint first_row, const uint num_rows, const bool all_threads) {
+    const uint y_idx = i * QUANT_K + y_offset;
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint ib0 = a_offset + (first_row+n)*num_blocks_per_row;
+        csel ^= 1;
+
+        if (!all_threads) {
+            if (i < num_blocks_per_row) {
+                sccache_gate[csel][ix][v_im][itid8] = FLOAT_TYPE(int8_t(((data_a_gate[ib0+i].scales[itid8] >> v_im4) & 0xF) | (((data_a_gate[ib0+i].scales[itid8%4+8] >> s_shift) & 3) << 4)) - 32);
+                sccache_up  [csel][ix][v_im][itid8] = FLOAT_TYPE(int8_t(((data_a_up  [ib0+i].scales[itid8] >> v_im4) & 0xF) | (((data_a_up  [ib0+i].scales[itid8%4+8] >> s_shift) & 3) << 4)) - 32);
+            }
+            barrier();
+            if (i >= num_blocks_per_row) continue;
+        }
+
+        // hmask + qs for gate
+        const uint32_t hmk_g = ~(uint32_t(data_a_gate_packed16[ib0 + i].hmask[v_in]) | (uint32_t(data_a_gate_packed16[ib0 + i].hmask[v_in + 8]) << 16));
+        const vec4 hmk_g0 = vec4(unpack8(((hmk_g & hm_m[0]) >> (    v_im4)) << 2));
+        const vec4 hmk_g1 = vec4(unpack8(((hmk_g & hm_m[1]) >> (1 + v_im4)) << 2));
+        const vec4 hmk_g2 = vec4(unpack8(((hmk_g & hm_m[2]) >> (2 + v_im4)) << 2));
+        const vec4 hmk_g3 = vec4(unpack8(((hmk_g & hm_m[3]) >> (3 + v_im4)) << 2));
+
+        uint32_t qs_g_u32 = uint32_t(data_a_gate[ib0 + i].qs[q_offset]) | (uint32_t(data_a_gate[ib0 + i].qs[q_offset + 1]) << 8);
+        qs_g_u32 |= (uint32_t(data_a_gate[ib0 + i].qs[q_offset + 16]) | (uint32_t(data_a_gate[ib0 + i].qs[q_offset + 17]) << 8)) << 16;
+        const vec4 qs_g0 = vec4(unpack8(qs_g_u32 & 0x03030303));
+        const vec4 qs_g2 = vec4(unpack8((qs_g_u32 >> 2) & 0x03030303));
+        const vec4 qs_g4 = vec4(unpack8((qs_g_u32 >> 4) & 0x03030303));
+        const vec4 qs_g6 = vec4(unpack8((qs_g_u32 >> 6) & 0x03030303));
+
+        // hmask + qs for up
+        const uint32_t hmk_u = ~(uint32_t(data_a_up_packed16[ib0 + i].hmask[v_in]) | (uint32_t(data_a_up_packed16[ib0 + i].hmask[v_in + 8]) << 16));
+        const vec4 hmk_u0 = vec4(unpack8(((hmk_u & hm_m[0]) >> (    v_im4)) << 2));
+        const vec4 hmk_u1 = vec4(unpack8(((hmk_u & hm_m[1]) >> (1 + v_im4)) << 2));
+        const vec4 hmk_u2 = vec4(unpack8(((hmk_u & hm_m[2]) >> (2 + v_im4)) << 2));
+        const vec4 hmk_u3 = vec4(unpack8(((hmk_u & hm_m[3]) >> (3 + v_im4)) << 2));
+
+        uint32_t qs_u_u32 = uint32_t(data_a_up[ib0 + i].qs[q_offset]) | (uint32_t(data_a_up[ib0 + i].qs[q_offset + 1]) << 8);
+        qs_u_u32 |= (uint32_t(data_a_up[ib0 + i].qs[q_offset + 16]) | (uint32_t(data_a_up[ib0 + i].qs[q_offset + 17]) << 8)) << 16;
+        const vec4 qs_u0 = vec4(unpack8(qs_u_u32 & 0x03030303));
+        const vec4 qs_u2 = vec4(unpack8((qs_u_u32 >> 2) & 0x03030303));
+        const vec4 qs_u4 = vec4(unpack8((qs_u_u32 >> 4) & 0x03030303));
+        const vec4 qs_u6 = vec4(unpack8((qs_u_u32 >> 6) & 0x03030303));
+
+        // Single shared B prefetch.
+        vec2 b0_p[NUM_COLS],  b16_p[NUM_COLS], b32_p[NUM_COLS], b48_p[NUM_COLS];
+        vec2 b64_p[NUM_COLS], b80_p[NUM_COLS], b96_p[NUM_COLS], b112_p[NUM_COLS];
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint by_idx = (j*p.batch_stride_b + b_offset + y_idx) / 2;
+            b0_p[j]   = vec2(data_b_v2[by_idx +  0]);
+            b16_p[j]  = vec2(data_b_v2[by_idx +  8]);
+            b32_p[j]  = vec2(data_b_v2[by_idx + 16]);
+            b48_p[j]  = vec2(data_b_v2[by_idx + 24]);
+            b64_p[j]  = vec2(data_b_v2[by_idx + 32]);
+            b80_p[j]  = vec2(data_b_v2[by_idx + 40]);
+            b96_p[j]  = vec2(data_b_v2[by_idx + 48]);
+            b112_p[j] = vec2(data_b_v2[by_idx + 56]);
+        }
+
+        if (all_threads) {
+            sccache_gate[csel][ix][v_im][itid8] = FLOAT_TYPE(int8_t(((data_a_gate[ib0+i].scales[itid8] >> v_im4) & 0xF) | (((data_a_gate[ib0+i].scales[itid8%4+8] >> s_shift) & 3) << 4)) - 32);
+            sccache_up  [csel][ix][v_im][itid8] = FLOAT_TYPE(int8_t(((data_a_up  [ib0+i].scales[itid8] >> v_im4) & 0xF) | (((data_a_up  [ib0+i].scales[itid8%4+8] >> s_shift) & 3) << 4)) - 32);
+            barrier();
+        }
+
+        const FLOAT_TYPE d_g = FLOAT_TYPE(data_a_gate[ib0 + i].d);
+        const FLOAT_TYPE d_u = FLOAT_TYPE(data_a_up  [ib0 + i].d);
+
+        // Hoist sccache reads into registers — both fma chains reuse all 8 entries each.
+        const FLOAT_TYPE sg0 = sccache_gate[csel][ix][v_im][0];
+        const FLOAT_TYPE sg1 = sccache_gate[csel][ix][v_im][1];
+        const FLOAT_TYPE sg2 = sccache_gate[csel][ix][v_im][2];
+        const FLOAT_TYPE sg3 = sccache_gate[csel][ix][v_im][3];
+        const FLOAT_TYPE sg4 = sccache_gate[csel][ix][v_im][4];
+        const FLOAT_TYPE sg5 = sccache_gate[csel][ix][v_im][5];
+        const FLOAT_TYPE sg6 = sccache_gate[csel][ix][v_im][6];
+        const FLOAT_TYPE sg7 = sccache_gate[csel][ix][v_im][7];
+
+        const FLOAT_TYPE su0 = sccache_up[csel][ix][v_im][0];
+        const FLOAT_TYPE su1 = sccache_up[csel][ix][v_im][1];
+        const FLOAT_TYPE su2 = sccache_up[csel][ix][v_im][2];
+        const FLOAT_TYPE su3 = sccache_up[csel][ix][v_im][3];
+        const FLOAT_TYPE su4 = sccache_up[csel][ix][v_im][4];
+        const FLOAT_TYPE su5 = sccache_up[csel][ix][v_im][5];
+        const FLOAT_TYPE su6 = sccache_up[csel][ix][v_im][6];
+        const FLOAT_TYPE su7 = sccache_up[csel][ix][v_im][7];
+
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            FLOAT_TYPE sum_g = FLOAT_TYPE(0.0);
+            FLOAT_TYPE sum_u = FLOAT_TYPE(0.0);
+            [[unroll]] for (int l = 0; l < 2; ++l) {
+                sum_g = fma(FLOAT_TYPE(  b0_p[j][l]) * sg0, qs_g0[l  ] - hmk_g0[l  ],
+                        fma(FLOAT_TYPE( b16_p[j][l]) * sg1, qs_g0[l+2] - hmk_g0[l+2],
+                        fma(FLOAT_TYPE( b32_p[j][l]) * sg2, qs_g2[l  ] - hmk_g1[l  ],
+                        fma(FLOAT_TYPE( b48_p[j][l]) * sg3, qs_g2[l+2] - hmk_g1[l+2],
+                        fma(FLOAT_TYPE( b64_p[j][l]) * sg4, qs_g4[l  ] - hmk_g2[l  ],
+                        fma(FLOAT_TYPE( b80_p[j][l]) * sg5, qs_g4[l+2] - hmk_g2[l+2],
+                        fma(FLOAT_TYPE( b96_p[j][l]) * sg6, qs_g6[l  ] - hmk_g3[l  ],
+                        fma(FLOAT_TYPE(b112_p[j][l]) * sg7, qs_g6[l+2] - hmk_g3[l+2], sum_g))))))));
+
+                sum_u = fma(FLOAT_TYPE(  b0_p[j][l]) * su0, qs_u0[l  ] - hmk_u0[l  ],
+                        fma(FLOAT_TYPE( b16_p[j][l]) * su1, qs_u0[l+2] - hmk_u0[l+2],
+                        fma(FLOAT_TYPE( b32_p[j][l]) * su2, qs_u2[l  ] - hmk_u1[l  ],
+                        fma(FLOAT_TYPE( b48_p[j][l]) * su3, qs_u2[l+2] - hmk_u1[l+2],
+                        fma(FLOAT_TYPE( b64_p[j][l]) * su4, qs_u4[l  ] - hmk_u2[l  ],
+                        fma(FLOAT_TYPE( b80_p[j][l]) * su5, qs_u4[l+2] - hmk_u2[l+2],
+                        fma(FLOAT_TYPE( b96_p[j][l]) * su6, qs_u6[l  ] - hmk_u3[l  ],
+                        fma(FLOAT_TYPE(b112_p[j][l]) * su7, qs_u6[l+2] - hmk_u3[l+2], sum_u))))))));
+            }
+            temp_gate[j][n] = fma(d_g, sum_g, temp_gate[j][n]);
+            temp_up  [j][n] = fma(d_u, sum_u, temp_up  [j][n]);
+        }
+    }
+}
+
+#ifdef USE_SUBGROUP_ADD_NO_SHMEM
+void reduce_pair(const uint d_offset, const uint first_row, const uint num_rows, const uint tid) {
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            temp_gate[j][n] = subgroupAdd(temp_gate[j][n]);
+            temp_up  [j][n] = subgroupAdd(temp_up  [j][n]);
+        }
+    }
+    if (tid == 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                const FLOAT_TYPE g = temp_gate[j][n];
+                const FLOAT_TYPE u = temp_up  [j][n];
+                const FLOAT_TYPE silu_g = g / (FLOAT_TYPE(1.0) + exp(-g));
+                data_d_gate[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(silu_g * u);
+            }
+        }
+    }
+}
+#else
+shared FLOAT_TYPE tmpsh_g[NUM_COLS][NUM_ROWS][BLOCK_SIZE];
+shared FLOAT_TYPE tmpsh_u[NUM_COLS][NUM_ROWS][BLOCK_SIZE];
+
+void reduce_pair(const uint d_offset, const uint first_row, const uint num_rows, const uint tid) {
+#if USE_SUBGROUP_ADD
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            temp_gate[j][n] = subgroupAdd(temp_gate[j][n]);
+            temp_up  [j][n] = subgroupAdd(temp_up  [j][n]);
+        }
+    }
+    if (gl_SubgroupInvocationID == 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                tmpsh_g[j][n][gl_SubgroupID] = temp_gate[j][n];
+                tmpsh_u[j][n][gl_SubgroupID] = temp_up  [j][n];
+            }
+        }
+    }
+    barrier();
+    if (tid == 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                FLOAT_TYPE acc_g = FLOAT_TYPE(0);
+                FLOAT_TYPE acc_u = FLOAT_TYPE(0);
+                [[unroll]] for (uint s = 0; s < gl_NumSubgroups; ++s) {
+                    acc_g += tmpsh_g[j][n][s];
+                    acc_u += tmpsh_u[j][n][s];
+                }
+                // Stage B fusion: write silu(gate)*up to the GLU's destination (binding 2 = data_d_gate slot).
+                const FLOAT_TYPE silu_g = acc_g / (FLOAT_TYPE(1.0) + exp(-acc_g));
+                data_d_gate[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(silu_g * acc_u);
+            }
+        }
+    }
+#else
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            tmpsh_g[j][n][tid] = temp_gate[j][n];
+            tmpsh_u[j][n][tid] = temp_up  [j][n];
+        }
+    }
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                    tmpsh_g[j][n][tid] += tmpsh_g[j][n][tid + s];
+                    tmpsh_u[j][n][tid] += tmpsh_u[j][n][tid + s];
+                }
+            }
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                // Stage B fusion: write silu(gate)*up to the GLU's destination (binding 2).
+                const FLOAT_TYPE g = tmpsh_g[j][n][0];
+                const FLOAT_TYPE u = tmpsh_u[j][n][0];
+                const FLOAT_TYPE silu_g = g / (FLOAT_TYPE(1.0) + exp(-g));
+                data_d_gate[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(silu_g * u);
+            }
+        }
+    }
+#endif
+}
+#endif
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    const uint expert_i0 = gl_WorkGroupID.y;
+    expert_id = data_ids[expert_i0 + p.expert_i1 * p.nbi1];
+
+    const uint a_offset = expert_id * (p.batch_stride_a / QUANT_K);
+    const uint b_offset = (expert_i0 % p.ne11) * p.stride_b + p.expert_i1 * p.batch_stride_b;
+    const uint d_offset = expert_i0 * p.stride_d + p.expert_i1 * p.batch_stride_d;
+
+    const uint num_blocks_per_row = p.ncols / QUANT_K;
+
+    const uint it_size = gl_WorkGroupSize.x/16;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint itid = tid%16;
+    const uint ix = tid/16;
+    const uint itid8 = itid%8;
+    const uint v_im = itid/8;
+    const uint v_im4 = v_im*4;
+    const uint v_in = itid - 8*v_im;
+
+    const uint32_t m = 0x01010101 << (4 * v_im);
+    uint32_t hm_m[4];
+    [[unroll]] for (uint j = 0; j < 4; ++j) hm_m[j] = m << j;
+
+    const uint l0 = 2*v_in;
+    const uint q_offset = 32*v_im + l0;
+    const uint y_offset = 128*v_im + l0;
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
+            temp_gate[j][i] = FLOAT_TYPE(0);
+            temp_up  [j][i] = FLOAT_TYPE(0);
+        }
+    }
+
+    const uint s_shift = v_im4 + 2*(itid8/4);
+
+    const uint nbr_par_th = num_blocks_per_row%it_size;
+    const uint nbr_all_th = num_blocks_per_row - nbr_par_th;
+    uint i0 = 0;
+    [[unroll]] for (; i0 < nbr_all_th; i0 += it_size)
+        calc_superblock(a_offset, b_offset, ix, itid8, v_im, v_im4, v_in, hm_m, q_offset, y_offset, s_shift, i0 + ix, num_blocks_per_row, first_row, num_rows, true);
+    calc_superblock(a_offset, b_offset, ix, itid8, v_im, v_im4, v_in, hm_m, q_offset, y_offset, s_shift, i0 + ix, num_blocks_per_row, first_row, num_rows, false);
+
+    reduce_pair(d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) return;
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}

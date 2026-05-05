@@ -702,6 +702,18 @@ void process_shaders() {
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
 
+        // Fused gate+up matvec for MoE FFN. q3_K only for now (Phase 3 Stage A).
+        if (tname == "q3_k") {
+            std::string gu_shader = "mul_mat_vec_id_gate_up_" + tname + ".comp";
+            std::map<std::string, std::string> gu_base = {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {data_a_key, "1"}};
+            string_to_spv("mul_mat_vec_id_gate_up_" + tname + "_f32_f32",                     gu_shader, merge_maps(gu_base, {{"B_TYPE", "float"},     {"B_TYPEV2", "vec2"},    {"D_TYPE", "float"}}));
+            string_to_spv("mul_mat_vec_id_gate_up_" + tname + "_f16_f32",                     gu_shader, merge_maps(gu_base, {{"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"D_TYPE", "float"}}));
+            string_to_spv("mul_mat_vec_id_gate_up_" + tname + "_f32_f32_subgroup",            gu_shader, merge_maps(gu_base, {{"B_TYPE", "float"},     {"B_TYPEV2", "vec2"},    {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv("mul_mat_vec_id_gate_up_" + tname + "_f16_f32_subgroup",            gu_shader, merge_maps(gu_base, {{"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv("mul_mat_vec_id_gate_up_" + tname + "_f32_f32_subgroup_no_shmem",   gu_shader, merge_maps(gu_base, {{"B_TYPE", "float"},     {"B_TYPEV2", "vec2"},    {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+            string_to_spv("mul_mat_vec_id_gate_up_" + tname + "_f16_f32_subgroup_no_shmem",   gu_shader, merge_maps(gu_base, {{"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+        }
+
         // mul mat vec with integer dot product
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
         if (is_legacy_quant(tname) || tname == "mxfp4" || is_k_quant(tname) || tname == "iq1_s" || tname == "iq1_m") {

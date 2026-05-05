@@ -3407,18 +3407,27 @@ static void ggml_vk_load_shaders(vk_device& device) {
             l_warptile = { 256, 128, 128, 16, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
             l_warptile_mmq = l_warptile_mmq_int = { 256, 128, 128, 32, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
             l_warptile_mmq_int_k = { 256, 128, 128, 32, subgroup_size_16, 64, 1, 4, 2, 1, subgroup_size_16 };
-        } else if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support && device->architecture == INTEL_XE2) {
-            // Xe2/Xe3 with coopmat enabled - warptile performance tuning
-            l_warptile = { 512, 128, 128, 16, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
-            l_warptile_mmq = { 512, 128, 128, 32, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
         }
 
+        // Cherry-pick from M. Corallo's "vulkan: Tweak Xe2 warptile configuration"
+        // (https://github.com/Hal9000AIML/arc-pro-b70-ubuntu-gpu-speedup-bugfixes patch
+        //  0001-vulkan-Tweak-Xe2-warptile-configuration.patch). Default wg_denoms / align
+        // are now established BEFORE chip-specific tuning so the Xe2 branch can override them.
         l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
         m_mmq_wg_denoms = m_wg_denoms = { 64,  64, 1 };
         s_mmq_wg_denoms = s_wg_denoms = { 32,  32, 1 };
         l_align = 128;
         m_align =  64;
         s_align =  32;
+
+        if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support && device->architecture == INTEL_XE2) {
+            // Xe2 with coopmat: smaller BC tile (64 vs 128) and shared-mem A-loads (16 lanes
+            // instead of 32) drop matmul register spills to zero. Measured by upstream patch
+            // author on Arc Pro B60: spills 47-75 -> 0, BF16 +57-68%, q-models +2-3%.
+            l_warptile = { 512, 128, 64, 16, subgroup_size_8, 16, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+            l_wg_denoms = {128, 64, 1};
+            l_warptile_mmq = { 512, 128, 128, 32, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+        }
 
         for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
             ggml_type t = (ggml_type)i;

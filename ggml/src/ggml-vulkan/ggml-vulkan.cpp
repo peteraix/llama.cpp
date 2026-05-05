@@ -4984,7 +4984,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->architecture = get_device_architecture(device->physical_device);
 
         const char* GGML_VK_PREFER_HOST_MEMORY = getenv("GGML_VK_PREFER_HOST_MEMORY");
-        device->prefer_host_memory = GGML_VK_PREFER_HOST_MEMORY != nullptr;
+        const char* GGML_VK_NO_PREFER_HOST_MEMORY = getenv("GGML_VK_NO_PREFER_HOST_MEMORY");
+        // Default-on for Intel UMA iGPU. Allocating in host-visible memory dodges CPU/GPU
+        // coherency syncs that don't exist on a discrete GPU but the backend still pays for.
+        const bool prefer_host_default = vk::PhysicalDeviceProperties(physical_devices[dev_num].getProperties()).vendorID == VK_VENDOR_ID_INTEL
+                                          && GGML_VK_NO_PREFER_HOST_MEMORY == nullptr;
+        device->prefer_host_memory = (GGML_VK_PREFER_HOST_MEMORY != nullptr) || prefer_host_default;
 
         const char* GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM = getenv("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM");
         device->disable_host_visible_vidmem = GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM != nullptr;

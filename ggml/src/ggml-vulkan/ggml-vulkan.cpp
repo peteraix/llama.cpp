@@ -6387,6 +6387,15 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
             if (m < 4096 && k >= 1024) {
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
+            // Intel iGPU: q6_K matvec is faster with LARGE wg for ALL m (when k is reasonable).
+            // Microbench Arc 130T: sub16 ~32-55 GB/s vs sub64 ~64-74 GB/s. The original q6_K
+            // "SUBGROUP for big m" rule was tuned for NVIDIA; on Intel Xe-LPG+ the smaller workgroup
+            // under-feeds the EUs because each WG has only one subgroup.
+            if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL
+                && k >= 1024
+                && !getenv("GGML_VK_Q6K_NO_LARGE")) {
+                dmmv_wg = DMMV_WG_SIZE_LARGE;
+            }
         } else if (a_type == GGML_TYPE_Q5_K && ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
             // On Intel Xe-LPG+, q5_K matvec is faster with SUBGROUP wg (measured +3% on Arc 130T).
             // The LARGE workgroup spreads M but increases inter-subgroup contention for q5_K's

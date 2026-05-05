@@ -57,18 +57,20 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ix, co
         }
 
         const uint32_t hmk = ~(uint32_t(data_a_packed16[ib0 + i].hmask[v_in]) | (uint32_t(data_a_packed16[ib0 + i].hmask[v_in + 8]) << 16));
-        const vec4 hmk_0 = vec4(unpack8(((hmk & hm_m[0]) >> (    v_im4)) << 2));
-        const vec4 hmk_1 = vec4(unpack8(((hmk & hm_m[1]) >> (1 + v_im4)) << 2));
-        const vec4 hmk_2 = vec4(unpack8(((hmk & hm_m[2]) >> (2 + v_im4)) << 2));
-        const vec4 hmk_3 = vec4(unpack8(((hmk & hm_m[3]) >> (3 + v_im4)) << 2));
+        // Pre-shift hmk 4 ways but keep as uint32 (16 bytes vs 64 bytes for vec4 fp16 form);
+        // unpack to fp16 lanes only inside the fma chain to reduce live-register pressure.
+        // This eliminated 864B scratch spill on Intel Xe-LPG+ (verified via VK pipeline stats).
+        const uint32_t hmk_p0 = (hmk & hm_m[0]) >> (    v_im4);
+        const uint32_t hmk_p1 = (hmk & hm_m[1]) >> (1 + v_im4);
+        const uint32_t hmk_p2 = (hmk & hm_m[2]) >> (2 + v_im4);
+        const uint32_t hmk_p3 = (hmk & hm_m[3]) >> (3 + v_im4);
 
-        // 0, 1, 16, 17
         uint32_t qs_u32 = uint32_t(data_a[ib0 + i].qs[q_offset]) | (uint32_t(data_a[ib0 + i].qs[q_offset + 1]) << 8);
         qs_u32 |= (uint32_t(data_a[ib0 + i].qs[q_offset + 16]) | (uint32_t(data_a[ib0 + i].qs[q_offset + 17]) << 8)) << 16;
-        const vec4 qs_u32_0 = vec4(unpack8(qs_u32 & 0x03030303));
-        const vec4 qs_u32_2 = vec4(unpack8((qs_u32 >> 2) & 0x03030303));
-        const vec4 qs_u32_4 = vec4(unpack8((qs_u32 >> 4) & 0x03030303));
-        const vec4 qs_u32_6 = vec4(unpack8((qs_u32 >> 6) & 0x03030303));
+        const uint32_t qs_p0 = qs_u32 & 0x03030303;
+        const uint32_t qs_p2 = (qs_u32 >> 2) & 0x03030303;
+        const uint32_t qs_p4 = (qs_u32 >> 4) & 0x03030303;
+        const uint32_t qs_p6 = (qs_u32 >> 6) & 0x03030303;
 
         // Activation B prefetch (kept; helps overlap loads with bit-twiddling).
         vec2 b0_p[NUM_COLS], b16_p[NUM_COLS], b32_p[NUM_COLS], b48_p[NUM_COLS];
@@ -87,20 +89,26 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ix, co
 
         const FLOAT_TYPE d = FLOAT_TYPE(data_a[ib0 + i].d);
 
+        // Per-fma unpack: extract one byte lane from packed uint32 inline.
+        // Equivalent to (vec4(unpack8(qsp))[idx] - vec4(unpack8(hmkp << 2))[idx]) but keeps the
+        // packed uint32s alive instead of materializing 4 fp16 vec4s — eliminates 864B spill.
+        #define QH(qsp, hmkp, idx) (FLOAT_TYPE(float((qsp >> (idx*8u)) & 0xFFu)) - FLOAT_TYPE(float(((hmkp << 2) >> (idx*8u)) & 0xFFu)))
+
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             FLOAT_TYPE sum = FLOAT_TYPE(0.0);
             [[unroll]] for (int l = 0; l < 2; ++l) {
-                sum = fma(FLOAT_TYPE(  b0_p[j][l]) * sc0, qs_u32_0[l  ] - hmk_0[l  ],
-                      fma(FLOAT_TYPE( b16_p[j][l]) * sc1, qs_u32_0[l+2] - hmk_0[l+2],
-                      fma(FLOAT_TYPE( b32_p[j][l]) * sc2, qs_u32_2[l  ] - hmk_1[l  ],
-                      fma(FLOAT_TYPE( b48_p[j][l]) * sc3, qs_u32_2[l+2] - hmk_1[l+2],
-                      fma(FLOAT_TYPE( b64_p[j][l]) * sc4, qs_u32_4[l  ] - hmk_2[l  ],
-                      fma(FLOAT_TYPE( b80_p[j][l]) * sc5, qs_u32_4[l+2] - hmk_2[l+2],
-                      fma(FLOAT_TYPE( b96_p[j][l]) * sc6, qs_u32_6[l  ] - hmk_3[l  ],
-                      fma(FLOAT_TYPE(b112_p[j][l]) * sc7, qs_u32_6[l+2] - hmk_3[l+2], sum))))))));
+                sum = fma(FLOAT_TYPE(  b0_p[j][l]) * sc0, QH(qs_p0, hmk_p0, uint(l    )),
+                      fma(FLOAT_TYPE( b16_p[j][l]) * sc1, QH(qs_p0, hmk_p0, uint(l + 2)),
+                      fma(FLOAT_TYPE( b32_p[j][l]) * sc2, QH(qs_p2, hmk_p1, uint(l    )),
+                      fma(FLOAT_TYPE( b48_p[j][l]) * sc3, QH(qs_p2, hmk_p1, uint(l + 2)),
+                      fma(FLOAT_TYPE( b64_p[j][l]) * sc4, QH(qs_p4, hmk_p2, uint(l    )),
+                      fma(FLOAT_TYPE( b80_p[j][l]) * sc5, QH(qs_p4, hmk_p2, uint(l + 2)),
+                      fma(FLOAT_TYPE( b96_p[j][l]) * sc6, QH(qs_p6, hmk_p3, uint(l    )),
+                      fma(FLOAT_TYPE(b112_p[j][l]) * sc7, QH(qs_p6, hmk_p3, uint(l + 2)), sum))))))));
             }
             temp[j][n] = fma(d, sum, temp[j][n]);
         }
+        #undef QH
     }
 }
 

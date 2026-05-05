@@ -6316,6 +6316,14 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
     VK_LOG_DEBUG("ggml_vk_get_dequantize_mul_mat_vec()");
     GGML_ASSERT(b_type == GGML_TYPE_F32 || b_type == GGML_TYPE_F16 || b_type == GGML_TYPE_Q8_1);
     GGML_ASSERT(num_cols >= 1 && num_cols <= mul_mat_vec_max_cols);
+    // experiment knobs: force SUBGROUP wg per-quant
+    const bool force_sub_q5k = getenv("GGML_VK_Q5K_FORCE_SUBGROUP") != nullptr;
+    const bool force_sub_q3k = getenv("GGML_VK_Q3K_FORCE_SUBGROUP") != nullptr;
+    const bool force_sub_q8_0 = getenv("GGML_VK_Q8_0_FORCE_SUBGROUP") != nullptr;
+    const bool force_sub_q4k = getenv("GGML_VK_Q4K_FORCE_SUBGROUP") != nullptr;
+    const bool force_sub_q2k = getenv("GGML_VK_Q2K_FORCE_SUBGROUP") != nullptr;
+    const bool force_large_q6k = getenv("GGML_VK_Q6K_FORCE_LARGE") != nullptr;
+    const bool force_large_q5k = getenv("GGML_VK_Q5K_FORCE_LARGE_M") != nullptr;
 
     if (b_type == GGML_TYPE_Q8_1) {
         switch (a_type) {
@@ -6384,6 +6392,13 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
         }
+        if (force_sub_q5k && a_type == GGML_TYPE_Q5_K) dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+        if (force_sub_q3k && a_type == GGML_TYPE_Q3_K) dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+        if (force_sub_q8_0 && a_type == GGML_TYPE_Q8_0) dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+        if (force_sub_q4k && a_type == GGML_TYPE_Q4_K) dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+        if (force_sub_q2k && a_type == GGML_TYPE_Q2_K) dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+        if (force_large_q6k && a_type == GGML_TYPE_Q6_K) dmmv_wg = DMMV_WG_SIZE_LARGE;
+        if (force_large_q5k && a_type == GGML_TYPE_Q5_K) dmmv_wg = DMMV_WG_SIZE_LARGE;
     }
 
     if (b_type == GGML_TYPE_Q8_1) {

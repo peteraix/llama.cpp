@@ -5223,9 +5223,13 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         std::vector<vk::QueueFamilyProperties> queue_family_props = device->physical_device.getQueueFamilyProperties();
 
-        // Try to find a non-graphics compute queue and transfer-focused queues
-        // Allow overriding avoiding the graphics queue because it can increase performance on RADV
-        const bool allow_graphics_queue = (getenv("GGML_VK_ALLOW_GRAPHICS_QUEUE") != nullptr);
+        // Try to find a non-graphics compute queue and transfer-focused queues.
+        // Default-avoid the graphics queue (helps RADV); allow it on Intel iGPU where the
+        // single hardware command engine makes the compute-only path costlier.
+        const bool intel_default_allow = device->properties.vendorID == VK_VENDOR_ID_INTEL
+                                         && getenv("GGML_VK_AVOID_GRAPHICS_QUEUE") == nullptr;
+        const bool allow_graphics_queue = (getenv("GGML_VK_ALLOW_GRAPHICS_QUEUE") != nullptr)
+                                         || intel_default_allow;
         const vk::QueueFlagBits graphics_flag = allow_graphics_queue ? (vk::QueueFlagBits)0 : vk::QueueFlagBits::eGraphics;
         const uint32_t compute_queue_family_index = ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eCompute, graphics_flag, -1, 1);
         const uint32_t transfer_queue_family_index = ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eTransfer, vk::QueueFlagBits::eCompute | graphics_flag, compute_queue_family_index, 1);

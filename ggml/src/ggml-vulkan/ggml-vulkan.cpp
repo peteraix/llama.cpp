@@ -4799,7 +4799,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
             GGML_ASSERT(is_pow2(S_V));
 
             uint32_t lanes_per_column;
-            if (S_V >= 128u && device->subgroup_clustered) {
+            // Intel iGPU: avoid the cluster-of-8 path (ROWS_PER_LANE=16 → 6.6 KB scratch memory =
+            // register spill on Arc 130T). Force the non-cluster path which gives ROWS_PER_LANE=8.
+            const bool intel_skip_cluster = device->vendor_id == VK_VENDOR_ID_INTEL
+                                            && getenv("GGML_VK_GDN_FORCE_CLUSTER") == nullptr;
+            if (S_V >= 128u && device->subgroup_clustered && !intel_skip_cluster) {
                 lanes_per_column = 8u;
             } else {
                 // Use largest power-of-two that divides both S_V and subgroup_size so that

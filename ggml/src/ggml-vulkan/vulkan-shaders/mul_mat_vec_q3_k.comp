@@ -92,7 +92,8 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ix, co
         // Per-fma unpack: extract one byte lane from packed uint32 inline.
         // Equivalent to (vec4(unpack8(qsp))[idx] - vec4(unpack8(hmkp << 2))[idx]) but keeps the
         // packed uint32s alive instead of materializing 4 fp16 vec4s — eliminates 864B spill.
-        #define QH(qsp, hmkp, idx) (FLOAT_TYPE(float((qsp >> (idx*8u)) & 0xFFu)) - FLOAT_TYPE(float(((hmkp << 2) >> (idx*8u)) & 0xFFu)))
+        // Single FLOAT_TYPE conversion (int sub first, then to fp16) saves one int→float op per fma.
+        #define QH(qsp, hmkp, idx) FLOAT_TYPE(int(int((qsp >> (idx*8u)) & 0xFFu) - int(((hmkp << 2) >> (idx*8u)) & 0xFFu)))
 
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             FLOAT_TYPE sum = FLOAT_TYPE(0.0);

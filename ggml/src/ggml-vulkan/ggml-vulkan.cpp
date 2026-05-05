@@ -6387,6 +6387,13 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
             if (m < 4096 && k >= 1024) {
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
+        } else if (a_type == GGML_TYPE_Q5_K && ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+            // On Intel Xe-LPG+, q5_K matvec is faster with SUBGROUP wg (measured +3% on Arc 130T).
+            // The LARGE workgroup spreads M but increases inter-subgroup contention for q5_K's
+            // dense scale-unpacking pattern. Toggle off via GGML_VK_Q5K_FORCE_LARGE.
+            if (getenv("GGML_VK_Q5K_FORCE_LARGE")) {
+                if (m <= 8192 && k >= 1024) dmmv_wg = DMMV_WG_SIZE_LARGE;
+            }
         } else {
             if (m <= 8192 && k >= 1024) {
                 dmmv_wg = DMMV_WG_SIZE_LARGE;

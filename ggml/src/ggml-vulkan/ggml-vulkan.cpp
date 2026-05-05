@@ -6387,12 +6387,13 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
             if (m < 4096 && k >= 1024) {
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
-            // Intel iGPU: q6_K matvec is faster with LARGE wg for ALL m (when k is reasonable).
-            // Microbench Arc 130T: sub16 ~32-55 GB/s vs sub64 ~64-74 GB/s. The original q6_K
-            // "SUBGROUP for big m" rule was tuned for NVIDIA; on Intel Xe-LPG+ the smaller workgroup
-            // under-feeds the EUs because each WG has only one subgroup.
+            // Intel iGPU: q6_K matvec is faster with LARGE wg for ALL m AND ALL k.
+            // Microbench Arc 130T (sub16-noshm vs sub64 nr2):
+            //   m=2048 k=512:  14.2us -> 11.6us  (-18%)
+            //   m=8192 k=2048: 252us -> 180us    (-29%)
+            //   m=248320 LM head: 7360us -> 5692us (-23%)
+            // The previous k>=1024 guard was stale; small-k q6_K (MoE down etc.) also wins.
             if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL
-                && k >= 1024
                 && !getenv("GGML_VK_Q6K_NO_LARGE")) {
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
@@ -6562,7 +6563,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
             return nullptr;
     }
 
-    // heuristic to choose workgroup size
+    // heuristic to choose workgroup size (matvec_id / MoE path)
     uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
     if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
         // Prefer larger workgroups when M is small, to spread the work out more
@@ -6570,6 +6571,12 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
         // q6_k seems to prefer small workgroup size even for "medium" values of M.
         if (a_type == GGML_TYPE_Q6_K) {
             if (m < 4096 && k >= 1024) {
+                dmmv_wg = DMMV_WG_SIZE_LARGE;
+            }
+            // Intel iGPU: same as the regular matvec dispatch — q6_K wins with LARGE wg
+            // even for k<1024 (e.g. q6_K MoE down m=2048 k=512 n=8 in Q4_K_M models).
+            if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL
+                && !getenv("GGML_VK_Q6K_NO_LARGE")) {
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
         } else {

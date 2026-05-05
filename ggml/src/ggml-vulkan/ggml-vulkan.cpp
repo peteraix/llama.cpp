@@ -726,6 +726,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
+    // Phase 3 Stage A: fused gate+up matvec for MoE FFN. q3_K only for now.
+    vk_pipeline pipeline_dequant_mul_mat_vec_id_gate_up_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
@@ -893,6 +895,7 @@ struct vk_device_struct {
     ggml_backend_buffer_type buffer_type;
 
     bool disable_fusion;
+    bool disable_fuse_gate_up;
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
@@ -1962,6 +1965,8 @@ struct ggml_backend_vk_context {
     int fused_ops_write_mask {};
     topk_moe_mode fused_topk_moe_mode {};
     bool fused_topk_moe_scale {};
+    // Phase 3 Stage A: gate+up MUL_MAT_ID pair was fused into a single dispatch
+    bool fused_gate_up {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -4378,6 +4383,30 @@ static void ggml_vk_load_shaders(vk_device& device) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_IQ1_M], "mul_mat_vec_id_iq1_m_q8_1_f32", arr_dmmv_id_iq1_m_q8_1_f32_len[reduc], arr_dmmv_id_iq1_m_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_iq_int(0), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(0)}, 1, true, use_subgroups, subgroup_size_int);
         }
 #endif // GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT
+
+        // Phase 3 Stage A: fused gate+up MUL_MAT_ID for MoE FFN. q3_K only for now.
+        // Bindings: 0=A_gate, 1=B, 2=D_gate, 3=A_up, 4=D_up, 5=ids (still 6 like the regular id pipelines).
+        {
+            const void * gate_up_q3_k_f32_f32_data_arr[3] = {
+                (const void *)mul_mat_vec_id_gate_up_q3_k_f32_f32_data,
+                (const void *)mul_mat_vec_id_gate_up_q3_k_f32_f32_subgroup_data,
+                (const void *)mul_mat_vec_id_gate_up_q3_k_f32_f32_subgroup_no_shmem_data,
+            };
+            const uint64_t gate_up_q3_k_f32_f32_len_arr[3] = {
+                mul_mat_vec_id_gate_up_q3_k_f32_f32_len,
+                mul_mat_vec_id_gate_up_q3_k_f32_f32_subgroup_len,
+                mul_mat_vec_id_gate_up_q3_k_f32_f32_subgroup_no_shmem_len,
+            };
+            // Gate+up fusion has 2× the live state of single-weight matvec. Use NUM_ROWS=1 to halve
+            // per-thread register pressure and fit better in Intel Xe-LPG+ register file.
+            const uint32_t gu_nr = (device->vendor_id == VK_VENDOR_ID_INTEL && !getenv("GGML_VK_GATE_UP_NR2"))
+                                   ? 1u : rm_kq;
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_gate_up_f32[w][GGML_TYPE_Q3_K],
+                "mul_mat_vec_id_gate_up_q3_k_f32",
+                gate_up_q3_k_f32_f32_len_arr[reduc16], gate_up_q3_k_f32_f32_data_arr[reduc16],
+                "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants),
+                {gu_nr, 1, 1}, {wg_size_subgroup16, gu_nr}, 1, true, use_subgroups16, force_subgroup_size16);
+        }
     }
 
 #if !defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
@@ -5716,6 +5745,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->idx = idx;
 
         device->disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr;
+        // Phase 3 Stage B (gate+up+SWIGLU MoE FFN fusion). Functional on q3_K, but a measured ~3%
+        // regression on Intel Xe Arc 130T iGPU: doubled register/shared-mem pressure inside the
+        // fused dispatch outweighs the dispatch-count saving. Off by default; opt in for tuning.
+        device->disable_fuse_gate_up = device->disable_fusion || getenv("GGML_VK_ENABLE_FUSE_GATE_UP") == nullptr;
 
         device->add_rms_fusion = !device->disable_fusion &&
                                  device->subgroup_arithmetic &&
@@ -6599,6 +6632,24 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
     }
 
     return ctx->device->pipeline_dequant_mul_mat_vec_id_f32[dmmv_wg][a_type];
+}
+
+// Phase 3 Stage A: pick the fused gate+up matvec_id pipeline.
+// Only q3_K + B=f32 is implemented; returns nullptr otherwise so the caller can fall back to the unfused path.
+static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id_gate_up(ggml_backend_vk_context * ctx, ggml_type a_type, ggml_type b_type, uint32_t m, uint32_t k) {
+    if (a_type != GGML_TYPE_Q3_K) {
+        return nullptr;
+    }
+    if (b_type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+    uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+    if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+        if (m <= 8192 && k >= 1024) {
+            dmmv_wg = DMMV_WG_SIZE_LARGE;
+        }
+    }
+    return ctx->device->pipeline_dequant_mul_mat_vec_id_gate_up_f32[dmmv_wg][a_type];
 }
 
 static void * ggml_vk_host_malloc(vk_device& device, size_t size) {
@@ -9003,6 +9054,145 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     }
 }
 
+// Phase 3 Stage B: dispatch a single fused gate+up+SWIGLU MUL_MAT_ID for MoE FFN.
+// node_idx     -> gate MUL_MAT_ID
+// node_idx + 1 -> up   MUL_MAT_ID
+// node_idx + 2 -> GLU(SWIGLU) consuming both
+// The fused dispatch writes silu(gate)*up directly to the GLU's destination tensor, eliminating the
+// separate gate/up intermediate writes and the SILU+MUL kernels.
+static void ggml_vk_mul_mat_vec_id_gate_up_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * dst_gate = cgraph->nodes[node_idx];
+    ggml_tensor * dst_up   = cgraph->nodes[node_idx + 1];
+    ggml_tensor * dst_silu = cgraph->nodes[node_idx + 2];   // GLU output, what downstream actually reads
+    ggml_tensor * src0_gate = dst_gate->src[0];
+    ggml_tensor * src0_up   = dst_up  ->src[0];
+    ggml_tensor * src1      = dst_gate->src[1];
+    ggml_tensor * ids       = dst_gate->src[2];
+
+    GGML_ASSERT(src0_gate->type == GGML_TYPE_Q3_K && src0_up->type == GGML_TYPE_Q3_K);
+    GGML_ASSERT(dst_up->src[1] == src1);
+    GGML_ASSERT(dst_up->src[2] == ids);
+    GGML_ASSERT(dst_silu->op == GGML_OP_GLU);
+    GGML_ASSERT(ggml_vk_dim01_contiguous(src0_gate));
+    GGML_ASSERT(ggml_vk_dim01_contiguous(src0_up));
+    GGML_ASSERT(ggml_vk_dim01_contiguous(src1) || src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(src0_gate->ne[0] == src0_up->ne[0]);
+    GGML_ASSERT(src0_gate->ne[1] == src0_up->ne[1]);
+    GGML_ASSERT(src0_gate->ne[2] == src0_up->ne[2]);
+    // GLU output dim must match either gate or up output dim (swiglu_split keeps same shape).
+    GGML_ASSERT(dst_silu->ne[0] == dst_gate->ne[0]);
+    GGML_ASSERT(dst_silu->ne[1] == dst_gate->ne[1]);
+
+    const uint64_t ne00 = src0_gate->ne[0];
+    const uint64_t ne01 = src0_gate->ne[1];
+
+    const uint64_t ne10 = src1->ne[0];
+    const uint64_t ne11 = src1->ne[1];
+
+    const uint64_t nei0 = ids->ne[0];
+    const uint64_t nei1 = ids->ne[1];
+    const uint32_t nbi1 = (uint32_t)(ids->nb[1] / sizeof(int));
+
+    const uint64_t ne20 = dst_gate->ne[0];
+    const uint64_t ne21 = dst_gate->ne[1];
+
+    const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
+    const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
+
+    vk_pipeline dmmv = ggml_vk_get_dequantize_mul_mat_vec_id_gate_up(ctx, src0_gate->type, src1->type, ne20, ne00);
+    GGML_ASSERT(dmmv != nullptr);  // ggml_vk_can_fuse_mul_mat_id_gate_up should not have allowed this otherwise.
+
+    // The src1 dequant/contig handling. We mirror the relevant subset of ggml_vk_mul_mat_vec_id_q_f16.
+    vk_pipeline to_fp16_vk_1 = nullptr;
+    if (y_non_contig) {
+        to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, src1->type);
+    } else {
+        to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx, src1->type);
+    }
+    const bool qy_needs_dequant = ((src1->type != GGML_TYPE_F16 && !f16_f32_kernel) || y_non_contig);
+    GGML_ASSERT(y_non_contig || !qy_needs_dequant);
+    GGML_ASSERT(!qy_needs_dequant || to_fp16_vk_1 != nullptr);
+
+    if (ggml_nbytes(src0_gate) > ctx->device->properties.limits.maxStorageBufferRange ||
+        ggml_nbytes(src0_up)   > ctx->device->properties.limits.maxStorageBufferRange) {
+        dmmv = ggml_vk_get_64b_indexing_pipeline(ctx, dmmv);
+    }
+
+    const uint64_t y_ne = ggml_nelements(src1);
+    const uint64_t y_sz = f16_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne;
+
+    if (qy_needs_dequant) {
+        if (y_sz > ctx->device->properties.limits.maxStorageBufferRange) {
+            GGML_ABORT("Requested preallocation size is too large");
+        }
+        if (ctx->prealloc_size_y < y_sz) {
+            ctx->prealloc_size_y = y_sz;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        ggml_pipeline_request_descriptor_sets(ctx, to_fp16_vk_1, 1);
+    }
+    ggml_pipeline_request_descriptor_sets(ctx, dmmv, nei1);
+
+    // Bind the GLU's destination as binding 2 (D_gate slot in the shader, repurposed as D_intermediate).
+    vk_subbuffer d_D_silu  = ggml_vk_tensor_subbuffer(ctx, dst_silu);
+    // Binding 4 (D_up) is reserved for ABI but the shader does not write to it; just hand it any valid buffer.
+    vk_subbuffer d_D_unused = ggml_vk_tensor_subbuffer(ctx, dst_gate);
+    vk_subbuffer d_Qx_gate = ggml_vk_tensor_subbuffer(ctx, src0_gate);
+    vk_subbuffer d_Qx_up   = ggml_vk_tensor_subbuffer(ctx, src0_up);
+    vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1);
+    vk_subbuffer d_ids = ggml_vk_tensor_subbuffer(ctx, ids);
+    vk_subbuffer d_Y = (qy_needs_dequant) ? vk_subbuffer{ ctx->prealloc_y, 0, ctx->prealloc_y->size } : d_Qy;
+
+    if (y_non_contig) {
+        if (ctx->prealloc_y_last_pipeline_used != to_fp16_vk_1.get() ||
+            ctx->prealloc_y_last_tensor_used != src1) {
+            if (ctx->prealloc_y_need_sync) {
+                ggml_vk_sync_buffers(ctx, subctx);
+            }
+            ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_1, src1, d_Qy, d_Y);
+            ctx->prealloc_y_last_pipeline_used = to_fp16_vk_1.get();
+            ctx->prealloc_y_last_tensor_used = src1;
+        }
+    }
+
+    uint32_t stride_batch_y = (uint32_t)(ne10 * ne11);
+    if (!ggml_vk_dim01_contiguous(src1) && !qy_needs_dequant) {
+        stride_batch_y = (uint32_t)(src1->nb[2] / ggml_type_size(src1->type));
+    }
+
+    const uint32_t max_groups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
+    uint32_t groups_x = (uint32_t)ne01;
+    uint32_t groups_z = 1;
+    if (ne01 > max_groups_x) {
+        groups_z = 64;
+        groups_x = CEIL_DIV(groups_x, groups_z);
+    }
+
+    for (uint32_t expert_i1 = 0; expert_i1 < nei1; ++expert_i1) {
+        const vk_mat_vec_id_push_constants pc = {
+            (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
+            (uint32_t)(ne00 * ne01), stride_batch_y, (uint32_t)(ne20 * ne21),
+            /*fusion_flags=*/0u,
+            (uint32_t)nei0, (uint32_t)ne11, expert_i1, nbi1
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
+            {
+                d_Qx_gate,  // binding 0: A_gate
+                d_Y,        // binding 1: B
+                d_D_silu,   // binding 2: D_intermediate (silu(gate)*up; dst is GLU output)
+                d_Qx_up,    // binding 3: A_up
+                d_D_unused, // binding 4: not written by the shader
+                d_ids,      // binding 5: ids
+            },
+            pc, { groups_x, (uint32_t)nei0, groups_z });
+    }
+
+    if (y_non_contig) {
+        ctx->prealloc_y_need_sync = true;
+    }
+}
+
 static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -9016,6 +9206,10 @@ static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx
     ggml_tensor * src1 = dst->src[1];
     ggml_tensor * src2 = dst->src[2];
     VK_LOG_DEBUG("ggml_vk_mul_mat_id(" << src0 << ", " << src1 << ", " << src2 << ", " << dst << ")");
+    if (ctx->fused_gate_up && ctx->num_additional_fused_ops == 2) {
+        ggml_vk_mul_mat_vec_id_gate_up_q_f16(ctx, subctx, cgraph, node_idx);
+        return;
+    }
     if (ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
         ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
@@ -14435,6 +14629,64 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
     return true;
 }
 
+// Phase 3 Stage B: detect a gate_proj + up_proj + SWIGLU triple in the MoE FFN.
+// All three nodes must be consecutive; the GLU must be a SWIGLU consuming gate as src0 and up as src1.
+static bool ggml_vk_can_fuse_mul_mat_id_gate_up(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (ctx->device->disable_fuse_gate_up) {
+        return false;
+    }
+    if (node_idx + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * gate = cgraph->nodes[node_idx];
+    const ggml_tensor * up   = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * glu  = cgraph->nodes[node_idx + 2];
+    if (gate->op != GGML_OP_MUL_MAT_ID || up->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
+        return false;
+    }
+    // GLU(swiglu_split) takes gate and up directly (src0, src1).
+    if (glu->src[0] != gate || glu->src[1] != up) {
+        return false;
+    }
+    if (gate->src[1] != up->src[1]) {
+        return false;
+    }
+    if (gate->src[2] != up->src[2]) {
+        return false;
+    }
+    if (gate->src[0]->type != up->src[0]->type) {
+        return false;
+    }
+    // Stage B scope: q3_K only.
+    if (gate->src[0]->type != GGML_TYPE_Q3_K) {
+        return false;
+    }
+    if (gate->type != up->type || gate->type != glu->type) {
+        return false;
+    }
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (gate->ne[d] != up->ne[d]) {
+            return false;
+        }
+        if (gate->src[0]->ne[d] != up->src[0]->ne[d]) {
+            return false;
+        }
+        if (gate->ne[d] != glu->ne[d]) {
+            return false;
+        }
+    }
+    if (!ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
+        return false;
+    }
+    if (!ggml_vk_dim01_contiguous(gate->src[0]) || !ggml_vk_dim01_contiguous(up->src[0])) {
+        return false;
+    }
+    return true;
+}
+
 static bool ggml_vk_can_fuse_topk_moe(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                       int node_idx, topk_moe_mode mode) {
 
@@ -14806,6 +15058,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
+        ctx->fused_gate_up = false;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
@@ -14840,6 +15093,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MUL_MAT_ID_MUL";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_mul_mat_id_gate_up(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                ctx->fused_gate_up = true;
+                fusion_string = "MUL_MAT_ID_GATE_UP_SWIGLU";
+                // Only the GLU output (node[i+2]) is consumed downstream; gate and up intermediates are dead.
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
+                op_srcs_fused_elementwise[2] = false;
             } else if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, { i + 4 }) &&
                        ggml_check_edges(cgraph, i, rms_norm_mul_rope_view_set_rows_edges) &&
                        ggml_vk_can_fuse_rms_norm_mul_rope(ctx, cgraph, i) &&

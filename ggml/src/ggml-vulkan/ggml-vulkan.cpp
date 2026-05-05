@@ -6404,6 +6404,11 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
             if (getenv("GGML_VK_Q5K_FORCE_LARGE")) {
                 if (m <= 8192 && k >= 1024) dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
+        } else if (a_type == GGML_TYPE_Q8_0 && ctx->device->vendor_id == VK_VENDOR_ID_INTEL
+                   && !getenv("GGML_VK_Q8_0_NO_LARGE")) {
+            // Intel iGPU: q8_0 also wins with LARGE wg even at k<1024.
+            // Microbench Arc 130T m=2048 k=512: sub16-noshm 13.2us -> sub64 9.9us (-25%).
+            if (m <= 8192) dmmv_wg = DMMV_WG_SIZE_LARGE;
         } else {
             if (m <= 8192 && k >= 1024) {
                 dmmv_wg = DMMV_WG_SIZE_LARGE;

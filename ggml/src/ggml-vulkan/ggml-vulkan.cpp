@@ -14754,12 +14754,27 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // Estimate the amount of matmul work by looking at the weight matrix size, and submit every 100MB
     // (and scaled down based on model size, so smaller models submit earlier).
     // Also submit at least every 100 nodes, in case there are workloads without as much matmul.
-    int nodes_per_submit = 100;
+    // Intel iGPU sweet spot at 300 nodes / 400 MB (measured Arc 130T tg128: 19.07 → 19.32). Default
+    // submits more often than necessary; larger submit batches better amortise host-side overhead.
+    int nodes_per_submit = (ctx->device->properties.vendorID == VK_VENDOR_ID_INTEL) ? 300 : 100;
     int submitted_nodes = 0;
     int submit_count = 0;
     uint64_t mul_mat_bytes = 0;
     uint64_t total_mul_mat_bytes = 0;
-    uint64_t mul_mat_bytes_per_submit = std::min(uint64_t(100*1000*1000), ctx->last_total_mul_mat_bytes / 40u);
+    uint64_t mul_mat_bytes_per_submit;
+    if (ctx->device->properties.vendorID == VK_VENDOR_ID_INTEL) {
+        mul_mat_bytes_per_submit = uint64_t(400*1000*1000);
+    } else {
+        mul_mat_bytes_per_submit = std::min(uint64_t(100*1000*1000), ctx->last_total_mul_mat_bytes / 40u);
+    }
+    if (const char* s = getenv("GGML_VK_BYTES_PER_SUBMIT")) {
+        uint64_t v = (uint64_t)atoll(s) * 1000000ull;  // input is in MB
+        if (v > 0) mul_mat_bytes_per_submit = v;
+    }
+    if (const char* s = getenv("GGML_VK_NODES_PER_SUBMIT")) {
+        int v = atoi(s);
+        if (v > 0) nodes_per_submit = v;
+    }
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (first_node_in_batch) {
             submit_node_idx = i;

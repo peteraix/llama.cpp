@@ -361,6 +361,22 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
             // https://www.intel.com/content/www/us/en/docs/oneapi/optimization-guide-gpu/2025-0/intel-xe-gpu-architecture.html
             return vk_device_architecture::INTEL_XE2;
         }
+        // Fallback for known Arrow Lake-H Xe2 device IDs that the Windows driver mis-reports with
+        // minSubgroupSize = 8 (see ggml-org/llama.cpp#20776). Off by default — measured tg128
+        // neutral (matvec path doesn't read the architecture flag), pp512 -27 t/s (the Xe2 coopmat
+        // matmul tuning from PR #18178 is for true Xe2 SIMD16, regresses on Arrow Lake's hybrid
+        // SIMD8 layout). Opt in with GGML_VK_XE2_DEVID_FALLBACK=1 if you specifically want the
+        // KHR_cooperative_matrix path (e.g. for future custom 8x8x16 SIMD8 shader work).
+        if (getenv("GGML_VK_XE2_DEVID_FALLBACK") != nullptr) {
+            switch (props.deviceID) {
+                case 0x7D51:  // Arc 140T / 130T (Arrow Lake-H)
+                case 0x7D45:  // Arrow Lake-H variant
+                case 0x7D55:  // Arrow Lake-H variant
+                case 0x7DD5:  // Arrow Lake-H variant
+                    return vk_device_architecture::INTEL_XE2;
+                default: break;
+            }
+        }
     } else if (props.vendorID == VK_VENDOR_ID_NVIDIA) {
         const std::vector<vk::ExtensionProperties> ext_props = device.enumerateDeviceExtensionProperties();
 

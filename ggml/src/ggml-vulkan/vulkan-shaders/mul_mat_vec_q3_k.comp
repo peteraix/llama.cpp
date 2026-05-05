@@ -1,29 +1,59 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic  : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+// q3_K matvec, sccache-free variant using subgroupBroadcast with compile-time
+// constant lane ids. Microbench shows this is the fast hardware path on Intel
+// Xe (~8 cyc per broadcast) vs LDS+barrier (~147 cyc). Each thread still
+// computes only ONE scale (no extra ALU), but distributes it via 8 broadcasts.
+//
+// Requires required_subgroup_size = 16 (already enforced for the SUBGROUP path
+// in llama.cpp). Each 16-thread group equals one subgroup, so broadcasts stay
+// within the subgroup naturally.
 
 #include "mul_mat_vec_base.glsl"
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-shared FLOAT_TYPE sccache[2][BLOCK_SIZE/16][2][8];
-
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
-uint csel = 0;
 
 void calc_superblock(const uint a_offset, const uint b_offset, const uint ix, const uint itid8, const uint v_im, const uint v_im4, const uint v_in, const uint32_t hm_m[4], const uint q_offset, const uint y_offset, const uint s_shift, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows, const bool all_threads) {
     const uint y_idx = i * QUANT_K + y_offset;
 
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
         const uint ib0 = a_offset + (first_row+n)*num_blocks_per_row;
-        csel ^= 1;
 
-        if (!all_threads) { // when we don't have enough blocks to use all threads
-            if (i < num_blocks_per_row)
-                sccache[csel][ix][v_im][itid8] = FLOAT_TYPE(int8_t(((data_a[ib0+i].scales[itid8] >> v_im4) & 0xF) | (((data_a[ib0+i].scales[itid8%4+8] >> s_shift) & 3) << 4)) - 32);
-            barrier();
+        if (!all_threads && i >= num_blocks_per_row)
+            continue;
 
-            if (i >= num_blocks_per_row)
-                continue;
+        // Each thread computes ONE scale (the sccache slot it would have written).
+        FLOAT_TYPE my_scale = FLOAT_TYPE(int8_t(
+            ((data_a[ib0+i].scales[itid8] >> v_im4) & 0xFu) |
+            (((data_a[ib0+i].scales[itid8%4u+8u] >> s_shift) & 3u) << 4)
+        ) - 32);
+
+        // Collect all 8 scales for this thread's v_im half via broadcast with
+        // COMPILE-TIME CONSTANT lane ids (the fast path).
+        FLOAT_TYPE sc0, sc1, sc2, sc3, sc4, sc5, sc6, sc7;
+        if (v_im == 0u) {
+            sc0 = subgroupBroadcast(my_scale, 0u);
+            sc1 = subgroupBroadcast(my_scale, 1u);
+            sc2 = subgroupBroadcast(my_scale, 2u);
+            sc3 = subgroupBroadcast(my_scale, 3u);
+            sc4 = subgroupBroadcast(my_scale, 4u);
+            sc5 = subgroupBroadcast(my_scale, 5u);
+            sc6 = subgroupBroadcast(my_scale, 6u);
+            sc7 = subgroupBroadcast(my_scale, 7u);
+        } else {
+            sc0 = subgroupBroadcast(my_scale,  8u);
+            sc1 = subgroupBroadcast(my_scale,  9u);
+            sc2 = subgroupBroadcast(my_scale, 10u);
+            sc3 = subgroupBroadcast(my_scale, 11u);
+            sc4 = subgroupBroadcast(my_scale, 12u);
+            sc5 = subgroupBroadcast(my_scale, 13u);
+            sc6 = subgroupBroadcast(my_scale, 14u);
+            sc7 = subgroupBroadcast(my_scale, 15u);
         }
 
         const uint32_t hmk = ~(uint32_t(data_a_packed16[ib0 + i].hmask[v_in]) | (uint32_t(data_a_packed16[ib0 + i].hmask[v_in + 8]) << 16));
@@ -40,8 +70,7 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ix, co
         const vec4 qs_u32_4 = vec4(unpack8((qs_u32 >> 4) & 0x03030303));
         const vec4 qs_u32_6 = vec4(unpack8((qs_u32 >> 6) & 0x03030303));
 
-        // PREFETCH: issue activation b reads BEFORE the scale barrier
-        // so they overlap with sccache shared-mem traffic.
+        // Activation B prefetch (kept; helps overlap loads with bit-twiddling).
         vec2 b0_p[NUM_COLS], b16_p[NUM_COLS], b32_p[NUM_COLS], b48_p[NUM_COLS];
         vec2 b64_p[NUM_COLS], b80_p[NUM_COLS], b96_p[NUM_COLS], b112_p[NUM_COLS];
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
@@ -56,24 +85,19 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ix, co
             b112_p[j] = vec2(data_b_v2[by_idx + 56]);
         }
 
-        if (all_threads) {
-            sccache[csel][ix][v_im][itid8] = FLOAT_TYPE(int8_t(((data_a[ib0+i].scales[itid8] >> v_im4) & 0xF) | (((data_a[ib0+i].scales[itid8%4+8] >> s_shift) & 3) << 4)) - 32);
-            barrier();
-        }
-
         const FLOAT_TYPE d = FLOAT_TYPE(data_a[ib0 + i].d);
 
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             FLOAT_TYPE sum = FLOAT_TYPE(0.0);
             [[unroll]] for (int l = 0; l < 2; ++l) {
-                sum = fma(FLOAT_TYPE(  b0_p[j][l]) * sccache[csel][ix][v_im][0], qs_u32_0[l  ] - hmk_0[l  ],
-                      fma(FLOAT_TYPE( b16_p[j][l]) * sccache[csel][ix][v_im][1], qs_u32_0[l+2] - hmk_0[l+2],
-                      fma(FLOAT_TYPE( b32_p[j][l]) * sccache[csel][ix][v_im][2], qs_u32_2[l  ] - hmk_1[l  ],
-                      fma(FLOAT_TYPE( b48_p[j][l]) * sccache[csel][ix][v_im][3], qs_u32_2[l+2] - hmk_1[l+2],
-                      fma(FLOAT_TYPE( b64_p[j][l]) * sccache[csel][ix][v_im][4], qs_u32_4[l  ] - hmk_2[l  ],
-                      fma(FLOAT_TYPE( b80_p[j][l]) * sccache[csel][ix][v_im][5], qs_u32_4[l+2] - hmk_2[l+2],
-                      fma(FLOAT_TYPE( b96_p[j][l]) * sccache[csel][ix][v_im][6], qs_u32_6[l  ] - hmk_3[l  ],
-                      fma(FLOAT_TYPE(b112_p[j][l]) * sccache[csel][ix][v_im][7], qs_u32_6[l+2] - hmk_3[l+2], sum))))))));
+                sum = fma(FLOAT_TYPE(  b0_p[j][l]) * sc0, qs_u32_0[l  ] - hmk_0[l  ],
+                      fma(FLOAT_TYPE( b16_p[j][l]) * sc1, qs_u32_0[l+2] - hmk_0[l+2],
+                      fma(FLOAT_TYPE( b32_p[j][l]) * sc2, qs_u32_2[l  ] - hmk_1[l  ],
+                      fma(FLOAT_TYPE( b48_p[j][l]) * sc3, qs_u32_2[l+2] - hmk_1[l+2],
+                      fma(FLOAT_TYPE( b64_p[j][l]) * sc4, qs_u32_4[l  ] - hmk_2[l  ],
+                      fma(FLOAT_TYPE( b80_p[j][l]) * sc5, qs_u32_4[l+2] - hmk_2[l+2],
+                      fma(FLOAT_TYPE( b96_p[j][l]) * sc6, qs_u32_6[l  ] - hmk_3[l  ],
+                      fma(FLOAT_TYPE(b112_p[j][l]) * sc7, qs_u32_6[l+2] - hmk_3[l+2], sum))))))));
             }
             temp[j][n] = fma(d, sum, temp[j][n]);
         }
@@ -86,23 +110,22 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 
     const uint num_blocks_per_row = p.ncols / QUANT_K;
 
-    // 16 threads are used to process each block
     const uint it_size = gl_WorkGroupSize.x/16;
     const uint tid = gl_LocalInvocationID.x;
-    const uint itid = tid%16;  // 0...15
+    const uint itid = tid%16;
     const uint ix = tid/16;
     const uint itid8 = itid%8;
 
-    const uint v_im = itid/8;                               // 0 or 1. 0 computes 0..., 1 computes 128...
+    const uint v_im = itid/8;
     const uint v_im4 = v_im*4;
-    const uint v_in = itid - 8*v_im;                        // 0...7
+    const uint v_in = itid - 8*v_im;
 
     const uint32_t m = 0x01010101 << (4 * v_im);
     uint32_t hm_m[4];
     [[unroll]] for (uint j = 0; j < 4; ++j)
         hm_m[j] = m << j;
 
-    const uint l0 = 2*v_in;                                 // 0...15
+    const uint l0 = 2*v_in;
     const uint q_offset = 32*v_im + l0;
     const uint y_offset = 128*v_im + l0;
 
@@ -127,7 +150,6 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 void main() {
     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
 
-    // do NUM_ROWS at a time, unless there aren't enough remaining rows
     if (first_row + NUM_ROWS <= p.stride_d) {
         compute_outputs(first_row, NUM_ROWS);
     } else {

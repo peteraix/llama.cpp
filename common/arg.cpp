@@ -2864,7 +2864,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--tools"}, "TOOL1,TOOL2,...",
         "experimental: whether to enable built-in tools for AI agents - do not enable in untrusted environments (default: no tools)\n"
         "specify \"all\" to enable all tools\n"
-        "available tools: read_file, file_glob_search, grep_search, exec_shell_command, write_file, edit_file, apply_diff",
+        "available tools: read_file, file_glob_search, grep_search, exec_shell_command, write_file, edit_file, apply_diff, get_datetime",
         [](common_params & params, const std::string & value) {
             params.server_tools = parse_csv_row(value);
         }
@@ -3380,7 +3380,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--spec-draft-poll", "--poll-draft"}, "<0|1>",
-        "Use polling to wait for draft model work (default: same as --poll])",
+        "Use polling to wait for draft model work (default: same as --poll)",
         [](common_params & params, int value) {
             params.speculative.draft.cpuparams.poll = value;
         }
@@ -3562,12 +3562,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--spec-type"}, "[none|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
+        {"--spec-type"}, "[none|mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
         string_format("type of speculative decoding to use when no draft model is provided (default: %s)\n",
             common_speculative_type_to_str(params.speculative.type).c_str()),
         [](common_params & params, const std::string & value) {
             if (value == "none") {
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
+            } else if (value == "mtp") {
+                params.speculative.type = COMMON_SPECULATIVE_TYPE_MTP;
             } else if (value == "ngram-cache") {
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
             } else if (value == "ngram-simple") {

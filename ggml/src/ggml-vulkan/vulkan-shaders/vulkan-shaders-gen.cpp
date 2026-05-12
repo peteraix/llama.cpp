@@ -712,6 +712,17 @@ void process_shaders() {
             string_to_spv("mul_mat_vec_id_gate_up_" + tname + "_f16_f32_subgroup",            gu_shader, merge_maps(gu_base, {{"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
             string_to_spv("mul_mat_vec_id_gate_up_" + tname + "_f32_f32_subgroup_no_shmem",   gu_shader, merge_maps(gu_base, {{"B_TYPE", "float"},     {"B_TYPEV2", "vec2"},    {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
             string_to_spv("mul_mat_vec_id_gate_up_" + tname + "_f16_f32_subgroup_no_shmem",   gu_shader, merge_maps(gu_base, {{"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+
+            // Wide-batch (NUM_COLS>1) specialization for q3_K matvec. Same dispatch interface
+            // as mul_mat_vec_q3_k but with hoisted dequant + 4 parallel fma chains, ~30% GFLOPS
+            // gain at n=4 on Intel Arc 130T. The default q3_k shader stays optimal for n=1.
+            std::string wide_shader = "mul_mat_vec_q3_k_wide.comp";
+            string_to_spv("mul_mat_vec_q3_k_wide_f32_f32",                   wide_shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"},     {"B_TYPEV2", "vec2"},    {"B_TYPEV4", "vec4"},    {"D_TYPE", "float"}}));
+            string_to_spv("mul_mat_vec_q3_k_wide_f16_f32",                   wide_shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}));
+            string_to_spv("mul_mat_vec_q3_k_wide_f32_f32_subgroup",          wide_shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"},     {"B_TYPEV2", "vec2"},    {"B_TYPEV4", "vec4"},    {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv("mul_mat_vec_q3_k_wide_f16_f32_subgroup",          wide_shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv("mul_mat_vec_q3_k_wide_f32_f32_subgroup_no_shmem", wide_shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"},     {"B_TYPEV2", "vec2"},    {"B_TYPEV4", "vec4"},    {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+            string_to_spv("mul_mat_vec_q3_k_wide_f16_f32_subgroup_no_shmem", wide_shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
         }
 
         // mul mat vec with integer dot product
@@ -1158,6 +1169,17 @@ void write_output_files() {
             src << "const uint64_t arr_dmmv_id_" << tname << "_" << btype << "_f32_len[3] =  {mul_mat_vec_id_" << tname << "_" << btype << "_f32_len,  mul_mat_vec_id_" << tname << "_" << btype << "_f32_subgroup_len, mul_mat_vec_id_"  << tname << "_" << btype << "_f32_subgroup_no_shmem_len};\n";
         }
     }
+    }
+
+    // q3_K wide-batch specialization: dispatcher arrays for the NUM_COLS>1 pipeline.
+    // Same shape as arr_dmmv_q3_k_<btype>_f32, just pointing to the wide-shader spv.
+    for (const std::string& btype : {"f16", "f32"}) {
+        hdr << "extern const void * arr_dmmv_q3_k_wide_"   << btype << "_f32_data[3];\n";
+        hdr << "extern const uint64_t arr_dmmv_q3_k_wide_" << btype << "_f32_len[3];\n";
+        if (basename(input_filepath) == "mul_mat_vec.comp") {
+            src << "const void * arr_dmmv_q3_k_wide_"   << btype << "_f32_data[3] = {mul_mat_vec_q3_k_wide_" << btype << "_f32_data, mul_mat_vec_q3_k_wide_" << btype << "_f32_subgroup_data, mul_mat_vec_q3_k_wide_" << btype << "_f32_subgroup_no_shmem_data};\n";
+            src << "const uint64_t arr_dmmv_q3_k_wide_" << btype << "_f32_len[3] =  {mul_mat_vec_q3_k_wide_" << btype << "_f32_len,  mul_mat_vec_q3_k_wide_" << btype << "_f32_subgroup_len, mul_mat_vec_q3_k_wide_"  << btype << "_f32_subgroup_no_shmem_len};\n";
+        }
     }
 
     if (input_filepath == "") {

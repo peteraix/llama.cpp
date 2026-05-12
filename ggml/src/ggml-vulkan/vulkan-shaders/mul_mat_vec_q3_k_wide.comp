@@ -3,14 +3,16 @@
 #extension GL_KHR_shader_subgroup_basic  : require
 #extension GL_KHR_shader_subgroup_ballot : require
 
-// q3_K matvec, sccache-free variant using subgroupBroadcast with compile-time
-// constant lane ids. Microbench shows this is the fast hardware path on Intel
-// Xe (~8 cyc per broadcast) vs LDS+barrier (~147 cyc). Each thread still
-// computes only ONE scale (no extra ALU), but distributes it via 8 broadcasts.
-//
-// Requires required_subgroup_size = 16 (already enforced for the SUBGROUP path
-// in llama.cpp). Each 16-thread group equals one subgroup, so broadcasts stay
-// within the subgroup naturally.
+// q3_K matvec, WIDE specialization for NUM_COLS>1 (pp4 / MTP verify path).
+// Differs from mul_mat_vec_q3_k.comp in the inner fma chain ONLY:
+//   - Materialize 16 dequanted byte-lane values ONCE per superblock (not 8×NUM_COLS
+//     inline unpacks like the n=1 variant — that approach quadruples ALU at n=4).
+//   - Load activation B per-col inside the j loop (size-1 lifetime) instead of an
+//     NUM_COLS-wide prefetch array that bloats live registers and re-spills.
+//   - 4 parallel fma chains (sa/sb/sc/sd, 4 fma deep each) tree-reduced, instead of
+//     one 16-deep dependency chain that serializes on the accumulator and starves
+//     EU latency hiding (single-chain → 16 sequential fmas; 4 chains → 4 in flight).
+// Net effect on Intel Arc 130T (Xe-LPG+): q3_K matvec n=4 GFLOPS goes from ~140 to ~200.
 
 #include "mul_mat_vec_base.glsl"
 
@@ -27,14 +29,11 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ix, co
         if (!all_threads && i >= num_blocks_per_row)
             continue;
 
-        // Each thread computes ONE scale (the sccache slot it would have written).
         FLOAT_TYPE my_scale = FLOAT_TYPE(int8_t(
             ((data_a[ib0+i].scales[itid8] >> v_im4) & 0xFu) |
             (((data_a[ib0+i].scales[itid8%4u+8u] >> s_shift) & 3u) << 4)
         ) - 32);
 
-        // Collect all 8 scales for this thread's v_im half via broadcast with
-        // COMPILE-TIME CONSTANT lane ids (the fast path).
         FLOAT_TYPE sc0, sc1, sc2, sc3, sc4, sc5, sc6, sc7;
         if (v_im == 0u) {
             sc0 = subgroupBroadcast(my_scale, 0u);
@@ -57,9 +56,6 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ix, co
         }
 
         const uint32_t hmk = ~(uint32_t(data_a_packed16[ib0 + i].hmask[v_in]) | (uint32_t(data_a_packed16[ib0 + i].hmask[v_in + 8]) << 16));
-        // Pre-shift hmk 4 ways but keep as uint32 (16 bytes vs 64 bytes for vec4 fp16 form);
-        // unpack to fp16 lanes only inside the fma chain to reduce live-register pressure.
-        // This eliminated 864B scratch spill on Intel Xe-LPG+ (verified via VK pipeline stats).
         const uint32_t hmk_p0 = (hmk & hm_m[0]) >> (    v_im4);
         const uint32_t hmk_p1 = (hmk & hm_m[1]) >> (1 + v_im4);
         const uint32_t hmk_p2 = (hmk & hm_m[2]) >> (2 + v_im4);
@@ -72,45 +68,64 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ix, co
         const uint32_t qs_p4 = (qs_u32 >> 4) & 0x03030303;
         const uint32_t qs_p6 = (qs_u32 >> 6) & 0x03030303;
 
-        // Activation B prefetch (kept; helps overlap loads with bit-twiddling).
-        vec2 b0_p[NUM_COLS], b16_p[NUM_COLS], b32_p[NUM_COLS], b48_p[NUM_COLS];
-        vec2 b64_p[NUM_COLS], b80_p[NUM_COLS], b96_p[NUM_COLS], b112_p[NUM_COLS];
-        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            const uint by_idx = (j*p.batch_stride_b + b_offset + y_idx) / 2;
-            b0_p[j]   = vec2(data_b_v2[by_idx +  0]);
-            b16_p[j]  = vec2(data_b_v2[by_idx +  8]);
-            b32_p[j]  = vec2(data_b_v2[by_idx + 16]);
-            b48_p[j]  = vec2(data_b_v2[by_idx + 24]);
-            b64_p[j]  = vec2(data_b_v2[by_idx + 32]);
-            b80_p[j]  = vec2(data_b_v2[by_idx + 40]);
-            b96_p[j]  = vec2(data_b_v2[by_idx + 48]);
-            b112_p[j] = vec2(data_b_v2[by_idx + 56]);
-        }
-
         const FLOAT_TYPE d = FLOAT_TYPE(data_a[ib0 + i].d);
 
-        // Per-fma unpack: extract one byte lane from packed uint32 inline.
-        // Equivalent to (vec4(unpack8(qsp))[idx] - vec4(unpack8(hmkp << 2))[idx]) but keeps the
-        // packed uint32s alive instead of materializing 4 fp16 vec4s — eliminates 864B spill.
-        // Single FLOAT_TYPE conversion (int sub first, then to fp16) saves one int→float op per fma.
-        //
-        // NOTE: This shader is tuned for NUM_COLS==1 (tg128 path). For NUM_COLS>1 the long
-        // 16-deep fma chain serializes on the accumulator and the inline-unpack work multiplies
-        // by NUM_COLS — mul_mat_vec_q3_k_wide.comp is the wide-batch specialization.
         #define QH(qsp, hmkp, idx) FLOAT_TYPE(int(int((qsp >> (idx*8u)) & 0xFFu) - int(((hmkp << 2) >> (idx*8u)) & 0xFFu)))
 
+        // Hoist: materialize all 16 dequanted bytes ONCE per superblock (fixed cost,
+        // independent of NUM_COLS, vs 8×NUM_COLS inline unpacks in the n=1 variant).
+        // NOTE: keep qh and sc SEPARATE — don't fold sc into qh as a "sq = sc * qh" pre-mul.
+        //   sc{0..7} are subgroupBroadcast values living in cheap uniform/broadcast regs;
+        //   merging sc × qh into per-thread sq forces all 16 values into per-thread GRF
+        //   and triggers spills on Intel Xe-LPG+ (measured -40% perf in a prior attempt).
+        FLOAT_TYPE qh_p0_0 = QH(qs_p0, hmk_p0, 0u);
+        FLOAT_TYPE qh_p0_1 = QH(qs_p0, hmk_p0, 1u);
+        FLOAT_TYPE qh_p0_2 = QH(qs_p0, hmk_p0, 2u);
+        FLOAT_TYPE qh_p0_3 = QH(qs_p0, hmk_p0, 3u);
+        FLOAT_TYPE qh_p1_0 = QH(qs_p2, hmk_p1, 0u);
+        FLOAT_TYPE qh_p1_1 = QH(qs_p2, hmk_p1, 1u);
+        FLOAT_TYPE qh_p1_2 = QH(qs_p2, hmk_p1, 2u);
+        FLOAT_TYPE qh_p1_3 = QH(qs_p2, hmk_p1, 3u);
+        FLOAT_TYPE qh_p2_0 = QH(qs_p4, hmk_p2, 0u);
+        FLOAT_TYPE qh_p2_1 = QH(qs_p4, hmk_p2, 1u);
+        FLOAT_TYPE qh_p2_2 = QH(qs_p4, hmk_p2, 2u);
+        FLOAT_TYPE qh_p2_3 = QH(qs_p4, hmk_p2, 3u);
+        FLOAT_TYPE qh_p3_0 = QH(qs_p6, hmk_p3, 0u);
+        FLOAT_TYPE qh_p3_1 = QH(qs_p6, hmk_p3, 1u);
+        FLOAT_TYPE qh_p3_2 = QH(qs_p6, hmk_p3, 2u);
+        FLOAT_TYPE qh_p3_3 = QH(qs_p6, hmk_p3, 3u);
+
+        // B loaded inside j loop (lifetime = single col, frees registers between iterations).
+        // 4 parallel fma chains (sa/sb/sc_acc/sd, 4 fma deep each) → 4 in flight, full EU pipeline.
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            FLOAT_TYPE sum = FLOAT_TYPE(0.0);
-            [[unroll]] for (int l = 0; l < 2; ++l) {
-                sum = fma(FLOAT_TYPE(  b0_p[j][l]) * sc0, QH(qs_p0, hmk_p0, uint(l    )),
-                      fma(FLOAT_TYPE( b16_p[j][l]) * sc1, QH(qs_p0, hmk_p0, uint(l + 2)),
-                      fma(FLOAT_TYPE( b32_p[j][l]) * sc2, QH(qs_p2, hmk_p1, uint(l    )),
-                      fma(FLOAT_TYPE( b48_p[j][l]) * sc3, QH(qs_p2, hmk_p1, uint(l + 2)),
-                      fma(FLOAT_TYPE( b64_p[j][l]) * sc4, QH(qs_p4, hmk_p2, uint(l    )),
-                      fma(FLOAT_TYPE( b80_p[j][l]) * sc5, QH(qs_p4, hmk_p2, uint(l + 2)),
-                      fma(FLOAT_TYPE( b96_p[j][l]) * sc6, QH(qs_p6, hmk_p3, uint(l    )),
-                      fma(FLOAT_TYPE(b112_p[j][l]) * sc7, QH(qs_p6, hmk_p3, uint(l + 2)), sum))))))));
-            }
+            const uint by_idx = (j*p.batch_stride_b + b_offset + y_idx) / 2;
+            vec2 b0   = vec2(data_b_v2[by_idx +  0]);
+            vec2 b16  = vec2(data_b_v2[by_idx +  8]);
+            vec2 b32  = vec2(data_b_v2[by_idx + 16]);
+            vec2 b48  = vec2(data_b_v2[by_idx + 24]);
+            vec2 b64  = vec2(data_b_v2[by_idx + 32]);
+            vec2 b80  = vec2(data_b_v2[by_idx + 40]);
+            vec2 b96  = vec2(data_b_v2[by_idx + 48]);
+            vec2 b112 = vec2(data_b_v2[by_idx + 56]);
+
+            FLOAT_TYPE sa = fma(FLOAT_TYPE(  b0[0]) * sc0, qh_p0_0,
+                            fma(FLOAT_TYPE( b16[0]) * sc1, qh_p0_2,
+                            fma(FLOAT_TYPE(  b0[1]) * sc0, qh_p0_1,
+                                FLOAT_TYPE( b16[1]) * sc1 * qh_p0_3)));
+            FLOAT_TYPE sb = fma(FLOAT_TYPE( b32[0]) * sc2, qh_p1_0,
+                            fma(FLOAT_TYPE( b48[0]) * sc3, qh_p1_2,
+                            fma(FLOAT_TYPE( b32[1]) * sc2, qh_p1_1,
+                                FLOAT_TYPE( b48[1]) * sc3 * qh_p1_3)));
+            FLOAT_TYPE sc_acc = fma(FLOAT_TYPE( b64[0]) * sc4, qh_p2_0,
+                                fma(FLOAT_TYPE( b80[0]) * sc5, qh_p2_2,
+                                fma(FLOAT_TYPE( b64[1]) * sc4, qh_p2_1,
+                                    FLOAT_TYPE( b80[1]) * sc5 * qh_p2_3)));
+            FLOAT_TYPE sd = fma(FLOAT_TYPE( b96[0])  * sc6, qh_p3_0,
+                            fma(FLOAT_TYPE(b112[0]) * sc7, qh_p3_2,
+                            fma(FLOAT_TYPE( b96[1])  * sc6, qh_p3_1,
+                                FLOAT_TYPE(b112[1]) * sc7 * qh_p3_3)));
+
+            FLOAT_TYPE sum = (sa + sb) + (sc_acc + sd);
             temp[j][n] = fma(d, sum, temp[j][n]);
         }
         #undef QH
